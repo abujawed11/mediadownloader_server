@@ -1,21 +1,29 @@
 ﻿from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.core.config import settings
-from app.api.routes import media, jobs
+from .core.config import get_settings
+from .api.routes.media import router as media_router
+from .api.routes.jobs import router as jobs_router
 
-app = FastAPI(title="Media Backend")
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(title=settings.APP_NAME)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins or ["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        max_age=86400,
+    )
 
-app.include_router(media.router, prefix="/media", tags=["media"])
-app.include_router(jobs.router, prefix="/media", tags=["jobs"])
+    @app.get("/health")
+    def health():
+        return {"ok": True}
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+    app.include_router(media_router)
+    app.include_router(jobs_router)
+    return app
+
+app = create_app()

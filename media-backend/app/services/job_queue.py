@@ -1,18 +1,22 @@
-﻿from rq import Queue
-from app.services.redis_conn import get_redis
+﻿from typing import Optional, Dict, Any
+from rq import Queue
+from rq.job import Job
+from .redis_conn import get_queue
+from ..core.logging import get_logger
 
-_q = None
+log = get_logger(__name__)
 
-def default_queue() -> Queue:
-    global _q
-    if _q is None:
-        _q = Queue("default", connection=get_redis())
-    return _q
-
-def enqueue_extract(url: str):
-    from app.workers.tasks.extract import extract_info_task
-    return default_queue().enqueue(extract_info_task, url)
-
-def enqueue_merge(url: str, fmt_selector: str, title_hint: str = ""):
-    from app.workers.tasks.download_merge import download_merge_task
-    return default_queue().enqueue(download_merge_task, url, fmt_selector, title_hint)
+def enqueue_download_merge(payload: Dict[str, Any]) -> Job:
+    """
+    payload expects: { url, format, title?, ext? }
+    """
+    q: Queue = get_queue()
+    job = q.enqueue(
+        "app.workers.tasks.download_merge.download_and_merge",
+        payload,
+        job_timeout=q.default_timeout,
+        meta={"progress01": 0.0, "status": "queued", "message": "queued"},
+        description=f"download_and_merge {payload.get('title') or payload.get('url')}"
+    )
+    log.info("Enqueued job %s for %s", job.id, payload.get("url"))
+    return job

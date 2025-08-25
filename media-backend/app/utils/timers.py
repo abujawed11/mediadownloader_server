@@ -1,9 +1,11 @@
-﻿# timing helpers (e.g., simple stopwatch)
-import time
+﻿import time
+from contextlib import contextmanager
 
-class Timer:
-    def __enter__(self):
-        self.t0 = time.time()
-        return self
-    def __exit__(self, *exc):
-        self.dt = time.time() - self.t0
+@contextmanager
+def timer(name: str):
+    t0 = time.time()
+    try:
+        yield
+    finally:
+        dt = (time.time() - t0) * 1000.0
+        print(f"[timer] {name}: {dt:.1f} ms")
