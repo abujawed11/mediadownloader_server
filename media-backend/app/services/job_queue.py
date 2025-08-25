@@ -5,6 +5,7 @@ from rq.job import Job
 from .redis_conn import get_queue
 from ..core.config import get_settings
 from ..core.logging import get_logger
+from ..workers.tasks.download_merge import download_and_merge   # 👈 import the callable
 
 log = get_logger(__name__)
 
@@ -17,7 +18,7 @@ def enqueue_download_merge(payload: Dict[str, Any]) -> Job:
 
     # NOTE: Avoid q.default_timeout (not present on some rq versions).
     job = q.enqueue(
-        "app.workers.tasks.download_merge.download_and_merge",
+        download_and_merge,
         payload,
         job_timeout=s.RQ_JOB_TTL,         # seconds
         result_ttl=s.RQ_RESULT_TTL,       # seconds
