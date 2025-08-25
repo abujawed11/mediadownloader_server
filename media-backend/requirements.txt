@@ -1,0 +1,14 @@
+﻿fastapi
+uvicorn[standard]
+pydantic-settings
+python-multipart
+httpx
+tenacity
+yt-dlp
+redis
+rq
+rq-scheduler
+boto3
+loguru
+python-slugify
+orjson
