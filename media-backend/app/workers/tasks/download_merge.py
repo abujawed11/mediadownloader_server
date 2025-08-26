@@ -584,9 +584,17 @@ def _pick_container_for_merge(v_ext: str) -> str:
         return "webm"
     return "mkv"
 
+
+
 def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    payload: { url, format, title?, ext? }
+    - If "format" contains "+": download video+audio separately and mux with ffmpeg (copy).
+    - Else: progressive direct download moved to storage.
+    Returns: { path, file_name, mime, size_bytes }
+    """
     url: str = payload["url"]
-    fmt: str = payload["format"]
+    fmt: str = payload["format"]              # e.g. "299+140" or "18"
     title: str = (payload.get("title") or "download").strip() or "download"
     hint_ext: Optional[str] = payload.get("ext")
 
@@ -600,23 +608,28 @@ def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
     try:
         _set_meta(status="started", progress01=0.0, message="started")
 
+        # -------------------- MERGE PATH (video+audio) --------------------
         if "+" in fmt:
             v_id, a_id = fmt.split("+", 1)
+
+            # Download parts with monotonic global progress:
+            # video = 0..80%, audio = 80..90%
             v_tmp_base = tmp_path(f"{safe_title}-{uid}-v")
             a_tmp_base = tmp_path(f"{safe_title}-{uid}-a")
 
-            v_path = _ydl_download(url, v_id, v_tmp_base, part="video", base=0.00, span=0.80)
-            a_path = _ydl_download(url, a_id, a_tmp_base, part="audio", base=0.80, span=0.10)
+            v_path = _ydl_download(url, v_id, v_tmp_base, part="video",  base=0.00, span=0.80)
+            a_path = _ydl_download(url, a_id, a_tmp_base, part="audio",  base=0.80, span=0.10)
 
             v_ext = _ext_of(v_path)
-            container = _pick_container_for_merge(v_ext)
+            container = _pick_container_for_merge(v_ext)  # "mp4" | "webm" | "mkv"
             log.info("[job %s] merging container=%s v_ext=%s", jid, container, v_ext)
 
             _set_meta(status="merging", message="merging", part="merging",
                       debugContainer=container, debugVExt=v_ext)
 
-            final_name = f"{safe_title}.{container}"
-            out_tmp = tmp_path(f"{safe_title}-{uid}-merged.{container}")
+            # Prepare paths (and a stable base so we can detect mkv fallback):
+            base_out   = tmp_path(f"{safe_title}-{uid}-merged")
+            out_tmp    = f"{base_out}.{container}"
             ffmpeg_log = tmp_path(f"{safe_title}-{uid}-ffmpeg.log")
             log.info("[job %s] ffmpeg log -> %s", jid, ffmpeg_log)
 
@@ -627,11 +640,12 @@ def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
                           mergeTimeSec=(time_sec or None))
 
             def on_debug(line: str):
-                _set_meta(debugLine=line)  # tiny snippets into meta
-                # mirror important lines to server log as well
+                # drip a compact debug line into meta; mirror key lines to server log
+                _set_meta(debugLine=line)
                 if ("time=" in line) or ("Stream mapping" in line) or ("muxing" in line):
                     log.info("[job %s] %s", jid, line)
 
+            # Merge (with AV1/faststart guard + MKV fallback handled in function)
             merge_with_progress_copy(
                 v_path, a_path, out_tmp,
                 container=container,
@@ -640,11 +654,22 @@ def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
                 stderr_log_path=ffmpeg_log,
             )
 
-            final_path = move_into_storage(out_tmp, final_name)
-            size_bytes = os.path.getsize(final_path)
-            mime = _guess_mime_from_ext(container)
-            log.info("[job %s] merged -> %s (%d bytes, %s)", jid, final_path, size_bytes, mime)
+            # Detect actual produced file (in case MKV fallback was used)
+            produced_path = out_tmp
+            produced_ext  = container
+            if not os.path.exists(produced_path):
+                alt = f"{base_out}.mkv"
+                if os.path.exists(alt):
+                    produced_path = alt
+                    produced_ext  = "mkv"
+                    log.info("[job %s] using mkv fallback %s", jid, alt)
 
+            final_name  = f"{safe_title}.{produced_ext}"
+            final_path  = move_into_storage(produced_path, final_name)
+            size_bytes  = os.path.getsize(final_path)
+            mime        = _guess_mime_from_ext(produced_ext)
+
+            log.info("[job %s] merged -> %s (%d bytes, %s)", jid, final_path, size_bytes, mime)
             _set_meta(status="finished", progress01=1.0, message="done", totalBytes=size_bytes)
 
             return {
@@ -654,17 +679,16 @@ def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "size_bytes": size_bytes,
             }
 
-        # Progressive
-        base = tmp_path(f"{safe_title}-{uid}")
+        # -------------------- PROGRESSIVE PATH --------------------
+        base      = tmp_path(f"{safe_title}-{uid}")
         file_path = _ydl_download(url, fmt, base, part="progressive", base=0.00, span=0.90)
-        ext = (os.path.splitext(file_path)[1] or "").lstrip(".") or (hint_ext or "mp4")
+        ext       = (os.path.splitext(file_path)[1] or "").lstrip(".") or (hint_ext or "mp4")
         final_name = f"{safe_title}.{ext}"
         final_path = move_into_storage(file_path, final_name)
         size_bytes = os.path.getsize(final_path)
-        mime = _guess_mime_from_ext(ext)
+        mime       = _guess_mime_from_ext(ext)
 
         log.info("[job %s] progressive -> %s (%d bytes, %s)", jid, final_path, size_bytes, mime)
-
         _set_meta(status="finished", progress01=1.0, message="done",
                   totalBytes=size_bytes, part="progressive")
 
@@ -679,3 +703,100 @@ def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
         log.exception("[job %s] download_and_merge failed: %s", jid, e)
         _set_meta(status="failed", message=str(e))
         raise
+
+
+# def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
+#     url: str = payload["url"]
+#     fmt: str = payload["format"]
+#     title: str = (payload.get("title") or "download").strip() or "download"
+#     hint_ext: Optional[str] = payload.get("ext")
+
+#     safe_title = "".join(c if c.isalnum() or c in " ._-" else "_" for c in title)
+#     uid = uuid.uuid4().hex[:8]
+
+#     job = get_current_job()
+#     jid = job.id if job else "unknown"
+#     log.info("[job %s] enqueue payload url=%s fmt=%s title=%s", jid, url, fmt, title)
+
+#     try:
+#         _set_meta(status="started", progress01=0.0, message="started")
+
+#         if "+" in fmt:
+#             v_id, a_id = fmt.split("+", 1)
+#             v_tmp_base = tmp_path(f"{safe_title}-{uid}-v")
+#             a_tmp_base = tmp_path(f"{safe_title}-{uid}-a")
+
+#             v_path = _ydl_download(url, v_id, v_tmp_base, part="video", base=0.00, span=0.80)
+#             a_path = _ydl_download(url, a_id, a_tmp_base, part="audio", base=0.80, span=0.10)
+
+#             v_ext = _ext_of(v_path)
+#             container = _pick_container_for_merge(v_ext)
+#             log.info("[job %s] merging container=%s v_ext=%s", jid, container, v_ext)
+
+#             _set_meta(status="merging", message="merging", part="merging",
+#                       debugContainer=container, debugVExt=v_ext)
+
+#             final_name = f"{safe_title}.{container}"
+#             out_tmp = tmp_path(f"{safe_title}-{uid}-merged.{container}")
+#             ffmpeg_log = tmp_path(f"{safe_title}-{uid}-ffmpeg.log")
+#             log.info("[job %s] ffmpeg log -> %s", jid, ffmpeg_log)
+
+#             def on_merge_progress(p01: float, time_sec: float | None):
+#                 _set_meta(status="merging",
+#                           progress01=max(0.01, min(0.99, p01)),
+#                           part="merging",
+#                           mergeTimeSec=(time_sec or None))
+
+#             def on_debug(line: str):
+#                 _set_meta(debugLine=line)  # tiny snippets into meta
+#                 # mirror important lines to server log as well
+#                 if ("time=" in line) or ("Stream mapping" in line) or ("muxing" in line):
+#                     log.info("[job %s] %s", jid, line)
+
+#             merge_with_progress_copy(
+#                 v_path, a_path, out_tmp,
+#                 container=container,
+#                 on_progress=on_merge_progress,
+#                 on_debug=on_debug,
+#                 stderr_log_path=ffmpeg_log,
+#             )
+
+#             final_path = move_into_storage(out_tmp, final_name)
+#             size_bytes = os.path.getsize(final_path)
+#             mime = _guess_mime_from_ext(container)
+#             log.info("[job %s] merged -> %s (%d bytes, %s)", jid, final_path, size_bytes, mime)
+
+#             _set_meta(status="finished", progress01=1.0, message="done", totalBytes=size_bytes)
+
+#             return {
+#                 "path": final_path,
+#                 "file_name": final_name,
+#                 "mime": mime,
+#                 "size_bytes": size_bytes,
+#             }
+
+#         # Progressive
+#         base = tmp_path(f"{safe_title}-{uid}")
+#         file_path = _ydl_download(url, fmt, base, part="progressive", base=0.00, span=0.90)
+#         ext = (os.path.splitext(file_path)[1] or "").lstrip(".") or (hint_ext or "mp4")
+#         final_name = f"{safe_title}.{ext}"
+#         final_path = move_into_storage(file_path, final_name)
+#         size_bytes = os.path.getsize(final_path)
+#         mime = _guess_mime_from_ext(ext)
+
+#         log.info("[job %s] progressive -> %s (%d bytes, %s)", jid, final_path, size_bytes, mime)
+
+#         _set_meta(status="finished", progress01=1.0, message="done",
+#                   totalBytes=size_bytes, part="progressive")
+
+#         return {
+#             "path": final_path,
+#             "file_name": final_name,
+#             "mime": mime,
+#             "size_bytes": size_bytes,
+#         }
+
+#     except Exception as e:
+#         log.exception("[job %s] download_and_merge failed: %s", jid, e)
+#         _set_meta(status="failed", message=str(e))
+#         raise
