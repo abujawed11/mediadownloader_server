@@ -12,6 +12,25 @@ router = APIRouter(prefix="/media", tags=["jobs"])
 log = get_logger(__name__)
 
 
+
+@router.get("/jobs/{job_id}/progress")
+def job_progress(job_id: str):
+    q = get_queue()
+    job = q.fetch_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    m = job.meta or {}
+    # Minimal payload for cheap polling
+    return {
+        "id": job.get_id(),
+        "status": m.get("status", "queued"),
+        "progress01": float(m.get("progress01", 0.0)),
+        "message": m.get("message"),
+        "finished": bool(job.is_finished),
+        "failed": bool(job.is_failed),
+    }
+
+
 def _job_to_response(job: Job) -> JobResponse:
     meta = job.meta or {}
     return JobResponse(

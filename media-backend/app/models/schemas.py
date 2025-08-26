@@ -45,3 +45,12 @@ class JobResponse(BaseModel):
     fileName: Optional[str] = None
     mime: Optional[str] = None
     sizeBytes: Optional[int] = None
+
+
+class JobProgress(BaseModel):
+    id: str
+    status: str
+    progress01: float = 0.0
+    message: Optional[str] = None
+    finished: bool = False
+    failed: bool = False
