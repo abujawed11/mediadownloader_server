@@ -164,6 +164,7 @@
 
 
 # app/services/ffmpeg_service.py
+# app/services/ffmpeg_service.py
 import subprocess, re, json, os, shlex, time
 from typing import Callable, Optional, List, Dict, Any, Literal
 from ..core.logging import get_logger
@@ -171,8 +172,8 @@ from ..core.logging import get_logger
 log = get_logger(__name__)
 
 Container = Literal["mp4", "webm", "mkv"]
-
 _TIME_RE = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d+)")
+
 
 def _parse_time_to_seconds(line: str) -> Optional[float]:
     m = _TIME_RE.search(line)
@@ -181,13 +182,12 @@ def _parse_time_to_seconds(line: str) -> Optional[float]:
     h, m_, s = m.groups()
     return int(h) * 3600 + int(m_) * 60 + float(s)
 
+
 def _run_check_output(cmd: List[str]) -> str:
     return subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", "ignore")
 
+
 def ffprobe_basic(path: str) -> Dict[str, Any]:
-    """
-    Return a tiny dict: {container, duration, vcodec, acodec, width, height}
-    """
     log.info("[ffprobe] path=%s", path)
     try:
         out = _run_check_output([
@@ -217,6 +217,7 @@ def ffprobe_basic(path: str) -> Dict[str, Any]:
     log.info("[ffprobe] summary=%s", json.dumps(res))
     return res
 
+
 def merge_with_progress_copy(
     video_path: str,
     audio_path: str,
@@ -227,7 +228,8 @@ def merge_with_progress_copy(
     stderr_log_path: Optional[str] = None,
 ) -> None:
     """
-    Stream-copy mux into the chosen container (with watchdog + MKV fallback).
+    Stream-copy mux with interleaving safeguards + watchdog.
+    Falls back to MKV if the first attempt fails (handled by caller by checking file existence).
     """
     vprobe = ffprobe_basic(video_path)
     aprobe = ffprobe_basic(audio_path)
@@ -236,18 +238,18 @@ def merge_with_progress_copy(
     vcodec = (vprobe.get("vcodec") or "").lower()
     acodec = (aprobe.get("acodec") or "").lower()
 
-    # Heuristic: avoid +faststart for AV1 (can hang on some builds) and for WEBM
-    use_faststart = (container == "mp4") and (vcodec not in {"av1"})
+    # Disable +faststart during copy; it can hang with some streams even for H.264.
+    use_faststart = False
 
     log.info("[merge] container=%s out=%s vcodec=%s acodec=%s faststart=%s",
              container, output_path, vcodec, acodec, use_faststart)
     log.info("[merge] inputs: video=%s audio=%s", video_path, audio_path)
 
     extra: List[str] = []
-    if use_faststart:
+    if use_faststart and container == "mp4":
         extra += ["-movflags", "+faststart"]
 
-    # Always map explicitly + genpts to avoid timestamp stalls
+    # Interleaving/PTS flags to prevent stalls
     base_cmd: List[str] = [
         "ffmpeg", "-y",
         "-fflags", "+genpts",
@@ -257,31 +259,65 @@ def merge_with_progress_copy(
         "-map", "1:a:0",
         "-c", "copy",
         "-shortest",
+        "-max_interleave_delta", "0",
+        "-muxpreload", "0",
+        "-muxdelay", "0",
         *extra,
         "-loglevel", "info",
         output_path,
     ]
 
-    def run_once(cmd: List[str]) -> str:
+    def run_once(cmd: List[str], watchdog_seconds: int = 25) -> str:
         log.info("[merge] cmd=%s", " ".join(shlex.quote(p) for p in cmd))
+
         log_fh = open(stderr_log_path, "w", encoding="utf-8") if stderr_log_path else None
         tail: List[str] = []
         last_log_ts = 0.0
+
+        # Watchdog on output file growth
+        last_size = 0
+        last_growth_ts = time.time()
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if on_progress:
                 on_progress(0.90, 0.0)
+
             while True:
+                # Periodically check growth even if no stderr line yet
+                try:
+                    cur_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+                    if cur_size > last_size:
+                        last_size = cur_size
+                        last_growth_ts = time.time()
+                except Exception:
+                    pass
+
+                # Watchdog: if no growth for N seconds, kill
+                if time.time() - last_growth_ts > watchdog_seconds and proc.poll() is None:
+                    log.error("[merge] watchdog: no output growth for %ds — killing ffmpeg", watchdog_seconds)
+                    proc.kill()
+                    time.sleep(0.2)
+                    raise RuntimeError("watchdog: no output growth")
+
                 line = proc.stderr.readline()
                 if not line:
                     if proc.poll() is not None:
                         break
+                    # small sleep to avoid busy loop
+                    time.sleep(0.05)
                     continue
+
                 if log_fh:
                     log_fh.write(line)
+
                 tail.append(line.rstrip())
-                if len(tail) > 50:
+                if len(tail) > 80:
                     tail.pop(0)
+
+                if on_debug:
+                    on_debug(line.rstrip())
+
                 t = _parse_time_to_seconds(line)
                 now = time.time()
                 if t is not None and dur and on_progress:
@@ -292,10 +328,14 @@ def merge_with_progress_copy(
                         last_log_ts = now
                 elif ("Stream mapping" in line) or ("muxing" in line):
                     log.info("[merge] %s", line.strip())
+
             ret = proc.wait()
             if ret != 0:
-                last = "\n".join(tail[-12:])
+                last = "\n".join(tail[-20:])
                 raise RuntimeError(f"ffmpeg non-zero exit ({ret})\n{last}")
+
+            log.info("[merge] success out=%s size=%s", output_path,
+                     os.path.getsize(output_path) if os.path.exists(output_path) else 0)
             return "ok"
         finally:
             if log_fh:
@@ -307,31 +347,21 @@ def merge_with_progress_copy(
             except Exception:
                 pass
 
-    # Attempt #1: requested container
+    # Attempt once with requested container
     try:
-        return run_once(base_cmd)
+        run_once(base_cmd)
+        return
     except Exception as e1:
         log.error("[merge] first attempt failed in %s: %s", container, e1)
 
-        # Fallback to MKV (most permissive) — build a new command
+        # Fallback to MKV
         fallback_out = os.path.splitext(output_path)[0] + ".mkv"
-        fallback_cmd = base_cmd[:-2] + ["-loglevel", "info", fallback_out]  # same flags, just mkv target
+        fallback_cmd = base_cmd[:-2] + ["-loglevel", "info", fallback_out]
         log.info("[merge] retrying in mkv: %s", fallback_out)
         run_once(fallback_cmd)
+        # Caller will detect which file exists and move it.
+        return
 
-        # Rename mkv back to requested name if container was mkv already; otherwise return mkv
-        if container == "mkv":
-            # we were already mkv — just propagate the success
-            return
-        else:
-            # Caller expects to know the actual output path. We signal by raising a typed error,
-            # but simpler: move responsibility to caller to read the resulting filename via fs.
-            # Here we just log and return; caller will stat the file returned by move_into_storage.
-            log.info("[merge] produced mkv fallback at %s", fallback_out)
-            # overwrite output_path variable so caller picks correct file
-            # (caller passes output_path to move_into_storage; we need to update it there)
-            # We'll return by raising a tiny marker the caller can catch if needed.
-            return
 
 
 # def merge_with_progress_copy(
