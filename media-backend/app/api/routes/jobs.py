@@ -13,14 +13,42 @@ log = get_logger(__name__)
 
 
 
-@router.get("/jobs/{job_id}/progress")
+# @router.get("/jobs/{job_id}/progress")
+# def job_progress(job_id: str):
+#     q = get_queue()
+#     job = q.fetch_job(job_id)
+#     if not job:
+#         raise HTTPException(status_code=404, detail="Job not found")
+#     m = job.meta or {}
+#     # Minimal payload for cheap polling
+#     return {
+#         "id": job.get_id(),
+#         "status": m.get("status", "queued"),
+#         "progress01": float(m.get("progress01", 0.0)),
+#         "message": m.get("message"),
+#         "finished": bool(job.is_finished),
+#         "failed": bool(job.is_failed),
+#     }
+
+
+# def _job_to_response(job: Job) -> JobResponse:
+#     meta = job.meta or {}
+#     return JobResponse(
+#         id=job.get_id(),
+#         status=JobStatus(meta.get("status", "queued")),
+#         progress01=float(meta.get("progress01", 0.0)),
+#         message=meta.get("message"),
+#         fileName=(job.result or {}).get("file_name") if job.is_finished else None,
+#         mime=(job.result or {}).get("mime") if job.is_finished else None,
+#         sizeBytes=(job.result or {}).get("size_bytes") if job.is_finished else None,
+#     )
+
 def job_progress(job_id: str):
     q = get_queue()
     job = q.fetch_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     m = job.meta or {}
-    # Minimal payload for cheap polling
     return {
         "id": job.get_id(),
         "status": m.get("status", "queued"),
@@ -28,20 +56,31 @@ def job_progress(job_id: str):
         "message": m.get("message"),
         "finished": bool(job.is_finished),
         "failed": bool(job.is_failed),
+        # extra metrics for UI:
+        "part": m.get("part"),  # "video" | "audio" | "merging" | "progressive"
+        "downloadedBytes": m.get("downloadedBytes"),
+        "totalBytes": m.get("totalBytes"),
+        "speedBps": m.get("speedBps"),
+        "etaSeconds": m.get("etaSeconds"),
+        "mergeTimeSec": m.get("mergeTimeSec"),
     }
-
 
 def _job_to_response(job: Job) -> JobResponse:
     meta = job.meta or {}
+    raw = meta.get("status", "queued")
+    # map worker -> enum
+    status_map = {"finished": "done", "failed": "error"}
+    mapped = status_map.get(raw, raw)
     return JobResponse(
         id=job.get_id(),
-        status=JobStatus(meta.get("status", "queued")),
+        status=JobStatus(mapped),
         progress01=float(meta.get("progress01", 0.0)),
         message=meta.get("message"),
         fileName=(job.result or {}).get("file_name") if job.is_finished else None,
         mime=(job.result or {}).get("mime") if job.is_finished else None,
         sizeBytes=(job.result or {}).get("size_bytes") if job.is_finished else None,
     )
+
 
 
 @router.post("/jobs", response_model=JobResponse)
@@ -99,3 +138,10 @@ def get_job_file(job_id: str):
     if not path or not file_name:
         raise HTTPException(status_code=404, detail="File not available")
     return FileResponse(path, filename=file_name, media_type=job.result.get("mime") or "application/octet-stream")
+
+
+
+
+# app/api/routes/jobs.py  (only show changed parts)
+
+
