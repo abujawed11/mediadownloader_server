@@ -177,24 +177,66 @@ def _set_meta(*, status: Optional[str] = None, progress01: Optional[float] = Non
     job.save_meta()
     _publish(job, m)
 
-def _ydl_download(url: str, fmt: str, outpath_noext: str, part: str) -> str:
-    """
-    Download a single format to outpath_noext (without extension).
-    Returns final absolute file path including extension.
-    Emits rich metrics via _set_meta during download.
-    """
+# def _ydl_download(url: str, fmt: str, outpath_noext: str, part: str) -> str:
+#     """
+#     Download a single format to outpath_noext (without extension).
+#     Returns final absolute file path including extension.
+#     Emits rich metrics via _set_meta during download.
+#     """
+#     def progress_hook(d):
+#         if d.get("status") == "downloading":
+#             try:
+#                 downloaded = int(d.get("downloaded_bytes") or 0)
+#                 total      = int(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
+#                 speed      = float(d.get("speed") or 0.0)  # bytes/s
+#                 eta        = int(d.get("eta") or 0)
+#                 p = (downloaded / total) if total > 0 else 0.0
+#                 _set_meta(
+#                     status="downloading",
+#                     progress01=max(0.01, min(0.99, p)),
+#                     part=part,                         # "video" | "audio"
+#                     downloadedBytes=downloaded,
+#                     totalBytes=(total or None),
+#                     speedBps=(speed or None),
+#                     etaSeconds=(eta or None),
+#                 )
+#             except Exception:
+#                 pass
+
+#     ydl_opts = {
+#         "quiet": True,
+#         "no_warnings": True,
+#         "outtmpl": outpath_noext + ".%(ext)s",
+#         "format": fmt,
+#         "progress_hooks": [progress_hook],
+#         "noplaylist": True,
+#     }
+#     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+#         info = ydl.extract_info(url, download=True)
+#         path = ydl.prepare_filename(info)
+#         # one last emit per part (defensive)
+#         try:
+#             size = os.path.getsize(path)
+#             _set_meta(part=part, lastPartBytes=size)
+#         except Exception:
+#             pass
+#         return path
+
+
+def _ydl_download(url: str, fmt: str, outpath_noext: str, part: str, base: float, span: float) -> str:
     def progress_hook(d):
         if d.get("status") == "downloading":
             try:
                 downloaded = int(d.get("downloaded_bytes") or 0)
                 total      = int(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
-                speed      = float(d.get("speed") or 0.0)  # bytes/s
+                speed      = float(d.get("speed") or 0.0)
                 eta        = int(d.get("eta") or 0)
-                p = (downloaded / total) if total > 0 else 0.0
+                p_local    = (downloaded / total) if total > 0 else 0.0
+                p01        = base + span * max(0.0, min(1.0, p_local))  # MONOTONIC MAPPING
                 _set_meta(
                     status="downloading",
-                    progress01=max(0.01, min(0.99, p)),
-                    part=part,                         # "video" | "audio"
+                    progress01=p01,
+                    part=part,
                     downloadedBytes=downloaded,
                     totalBytes=(total or None),
                     speedBps=(speed or None),
@@ -202,25 +244,17 @@ def _ydl_download(url: str, fmt: str, outpath_noext: str, part: str) -> str:
                 )
             except Exception:
                 pass
-
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
+        "quiet": True, "no_warnings": True,
         "outtmpl": outpath_noext + ".%(ext)s",
-        "format": fmt,
-        "progress_hooks": [progress_hook],
+        "format": fmt, "progress_hooks": [progress_hook],
         "noplaylist": True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         path = ydl.prepare_filename(info)
-        # one last emit per part (defensive)
-        try:
-            size = os.path.getsize(path)
-            _set_meta(part=part, lastPartBytes=size)
-        except Exception:
-            pass
         return path
+
 
 def _guess_mime_from_ext(ext: str) -> str:
     ext = (ext or "").lower()
@@ -258,8 +292,10 @@ def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
             v_tmp_base = tmp_path(f"{safe_title}-{uid}-v")
             a_tmp_base = tmp_path(f"{safe_title}-{uid}-a")
 
-            v_path = _ydl_download(url, v_id, v_tmp_base, part="video")
-            a_path = _ydl_download(url, a_id, a_tmp_base, part="audio")
+            # v_path = _ydl_download(url, v_id, v_tmp_base, part="video")
+            v_path = _ydl_download(url, v_id, v_tmp_base, part="video", base=0.0, span=0.80)
+            # a_path = _ydl_download(url, a_id, a_tmp_base, part="audio")
+            a_path = _ydl_download(url, a_id, a_tmp_base, part="audio", base=0.80, span=0.10)
 
             # merging with ffmpeg + live progress
             _set_meta(status="merging", message="merging", part="merging")
@@ -290,7 +326,8 @@ def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         # Progressive single download
         base = tmp_path(f"{safe_title}-{uid}")
-        file_path = _ydl_download(url, fmt, base, part="progressive")
+        # file_path = _ydl_download(url, fmt, base, part="progressive")
+        file_path = _ydl_download(url, fmt, base, part="progressive", base=0.0, span=0.90)
         ext = (os.path.splitext(file_path)[1] or "").lstrip(".") or (hint_ext or "mp4")
         final_name = f"{safe_title}.{ext}"
         final_path = move_into_storage(file_path, final_name)
