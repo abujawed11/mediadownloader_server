@@ -232,7 +232,7 @@ def _ydl_download(url: str, fmt: str, outpath_noext: str, part: str, base: float
                 speed      = float(d.get("speed") or 0.0)
                 eta        = int(d.get("eta") or 0)
                 p_local    = (downloaded / total) if total > 0 else 0.0
-                p01        = base + span * max(0.0, min(1.0, p_local))  # MONOTONIC MAPPING
+                p01        = base + span * max(0.0, min(1.0, p_local))  # MONOTONIC
                 _set_meta(
                     status="downloading",
                     progress01=p01,
@@ -252,8 +252,8 @@ def _ydl_download(url: str, fmt: str, outpath_noext: str, part: str, base: float
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        path = ydl.prepare_filename(info)
-        return path
+        return ydl.prepare_filename(info)
+
 
 
 def _guess_mime_from_ext(ext: str) -> str:
@@ -293,8 +293,10 @@ def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
             a_tmp_base = tmp_path(f"{safe_title}-{uid}-a")
 
             # v_path = _ydl_download(url, v_id, v_tmp_base, part="video")
-            v_path = _ydl_download(url, v_id, v_tmp_base, part="video", base=0.0, span=0.80)
+            # v_path = _ydl_download(url, v_id, v_tmp_base, part="video", base=0.0, span=0.80)
             # a_path = _ydl_download(url, a_id, a_tmp_base, part="audio")
+            # a_path = _ydl_download(url, a_id, a_tmp_base, part="audio", base=0.80, span=0.10)
+            v_path = _ydl_download(url, v_id, v_tmp_base, part="video", base=0.0, span=0.80)
             a_path = _ydl_download(url, a_id, a_tmp_base, part="audio", base=0.80, span=0.10)
 
             # merging with ffmpeg + live progress
@@ -327,6 +329,7 @@ def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Progressive single download
         base = tmp_path(f"{safe_title}-{uid}")
         # file_path = _ydl_download(url, fmt, base, part="progressive")
+        # file_path = _ydl_download(url, fmt, base, part="progressive", base=0.0, span=0.90)
         file_path = _ydl_download(url, fmt, base, part="progressive", base=0.0, span=0.90)
         ext = (os.path.splitext(file_path)[1] or "").lstrip(".") or (hint_ext or "mp4")
         final_name = f"{safe_title}.{ext}"

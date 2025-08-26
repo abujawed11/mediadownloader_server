@@ -4,6 +4,7 @@ from .core.config import get_settings
 from .api.routes.media import router as media_router
 from .api.routes.jobs import router as jobs_router
 from .api.routes.jobs_ws import router as jobs_ws_router  # NEW
+from .api.routes.jobs_bus import router as jobs_bus_router  # NEW
 
 def create_app() -> FastAPI:
     settings = get_settings()
@@ -26,6 +27,7 @@ def create_app() -> FastAPI:
     app.include_router(media_router)
     app.include_router(jobs_router)
     app.include_router(jobs_ws_router)  # NEW
+    app.include_router(jobs_bus_router)  # NEW
     return app
 
 app = create_app()
