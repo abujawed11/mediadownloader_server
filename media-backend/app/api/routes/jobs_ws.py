@@ -150,8 +150,10 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
         except Exception:
             pass
 
-# Frontend expects individual job endpoints
+# DISABLED: Individual job endpoints - causing infinite loops
 @router.websocket("/ws/jobs/{job_id}")
-async def ws_job_progress_legacy(websocket: WebSocket, job_id: str):
-    """WebSocket endpoint for individual job progress - matches frontend expectations"""
-    await ws_task_progress(websocket, job_id)
+async def ws_job_progress_disabled(websocket: WebSocket, job_id: str):
+    """DISABLED individual job progress - use global /ws/jobs instead"""
+    await websocket.accept()
+    await websocket.send_text('{"error": "Individual job websockets disabled. Use global /ws/jobs bus."}')
+    await websocket.close(code=1003, reason="Individual job websockets disabled")
