@@ -71,13 +71,17 @@ def update_task_progress(status: str, progress: float = None, **extra):
                 frontend_data[key] = value
                 
         # Add completion flags for frontend logic
-        if status.lower() in ["completed", "success"]:
+        if status.lower() in ["completed", "success"] or extra.get("finished"):
             frontend_data["finished"] = True
-        elif status.lower() in ["failed", "error"]:
+        elif status.lower() in ["failed", "error"] or extra.get("failed"):
             frontend_data["failed"] = True
             
         log.info(f"[{current_task.request.id}] Publishing to Redis channel {channel}: {frontend_data}")
         redis_client.publish(channel, json.dumps(frontend_data))
+        
+        # Clear old progress updates when job is finished
+        if frontend_data.get("finished") or frontend_data.get("failed"):
+            log.info(f"[{current_task.request.id}] Job finished, no more progress updates will be sent")
     except Exception as e:
         log.error(f"Failed to publish progress: {e}")
 
@@ -190,7 +194,8 @@ def stream_download(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         }
         
         update_task_progress("completed", 1.0, 
-                           message="Download completed", 
+                           message="Download completed",
+                           finished=True,
                            **result)
         
         log.info(f"[{self.request.id}] Stream download completed: {final_path}")
@@ -198,7 +203,7 @@ def stream_download(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         
     except Exception as e:
         log.error(f"[{self.request.id}] Stream download failed: {e}")
-        update_task_progress("failed", message=str(e))
+        update_task_progress("failed", message=str(e), failed=True)
         raise
 
 @celery_app.task(bind=True)
@@ -272,7 +277,8 @@ def download_and_merge(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         }
         
         update_task_progress("completed", 1.0, 
-                           message="Download and merge completed", 
+                           message="Download and merge completed",
+                           finished=True,
                            **result)
         
         log.info(f"[{self.request.id}] Merge download completed: {final_path}")
@@ -280,5 +286,5 @@ def download_and_merge(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         
     except Exception as e:
         log.error(f"[{self.request.id}] Merge download failed: {e}")
-        update_task_progress("failed", message=str(e))
+        update_task_progress("failed", message=str(e), failed=True)
         raise
