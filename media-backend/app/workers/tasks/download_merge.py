@@ -1,6 +1,6 @@
 ﻿# app/workers/tasks/download_merge.py
 
-import os, uuid
+import os, uuid, time
 from typing import Dict, Any, Optional
 from rq import get_current_job
 import yt_dlp
@@ -70,10 +70,73 @@ def _ydl_download(url: str, fmt: str, outpath_noext: str, part: str, base: float
         "outtmpl": outpath_noext + ".%(ext)s",
         "format": fmt, "progress_hooks": [progress_hook],
         "noplaylist": True,
+        
+        # Timeout and retry configurations
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "file_access_retries": 3,
+        
+        # Socket timeout configurations
+        "socket_timeout": 60,
+        
+        # HTTP configurations for better reliability
+        "http_chunk_size": 10485760,  # 10MB chunks
+        "concurrent_fragment_downloads": 1,  # Conservative for stability
+        
+        # Additional reliability options
+        "continue_dl": True,  # Resume partial downloads
+        "no_check_certificates": False,  # Keep certificate validation
+        "prefer_insecure": False,  # Use HTTPS when available
+        
+        # User agent to avoid blocking
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        
+        # Additional headers for better compatibility
+        "headers": {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-us,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
+    # Implement exponential backoff retry logic
+    max_retries = 3
+    base_delay = 2  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                return ydl.prepare_filename(info)
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            # Check if this is a timeout or network-related error
+            if any(keyword in error_msg for keyword in [
+                'timeout', 'timed out', 'connection', 'network', 
+                'temporary failure', 'read operation', 'socket'
+            ]):
+                if attempt < max_retries - 1:  # Not the last attempt
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    log.warning(f"Network error on attempt {attempt + 1}/{max_retries}: {e}. Retrying in {delay}s...")
+                    _set_meta(
+                        status="retrying", 
+                        message=f"Network error, retrying in {delay}s... (attempt {attempt + 1}/{max_retries})",
+                        retryAttempt=attempt + 1,
+                        maxRetries=max_retries
+                    )
+                    time.sleep(delay)
+                    continue
+                else:
+                    log.error(f"All retry attempts failed. Final error: {e}")
+                    raise
+            else:
+                # Non-network error, don't retry
+                log.error(f"Non-recoverable error: {e}")
+                raise
 
 
 def download_and_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
