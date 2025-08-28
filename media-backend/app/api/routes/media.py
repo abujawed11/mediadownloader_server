@@ -73,6 +73,30 @@ def _approx_size(f: Dict[str, Any]) -> Optional[int]:
     return _safe_int(f.get("filesize") or f.get("filesize_approx"))
 
 
+def _estimate_merged_size(video: Dict[str, Any], audio: Dict[str, Any], duration: Optional[int] = None) -> Optional[int]:
+    """Better size estimation for merged video+audio streams."""
+    v_size = _approx_size(video)
+    a_size = _approx_size(audio)
+    
+    # If we have both sizes, use them but add 15% overhead for container
+    if v_size and a_size:
+        return int((v_size + a_size) * 1.15)
+    
+    # Fallback: estimate based on bitrates and duration if available
+    if duration:
+        v_tbr = video.get("tbr") or video.get("vbr") or 0
+        a_tbr = audio.get("tbr") or audio.get("abr") or 0
+        
+        if v_tbr and a_tbr:
+            # Convert kbps to bytes per second, multiply by duration, add 20% overhead
+            total_bps = (v_tbr + a_tbr) * 1000 / 8  # kbps to bytes per second
+            estimated = int(total_bps * duration * 1.2)
+            return estimated
+    
+    # Last resort: use available size or return None
+    return v_size or a_size
+
+
 def _family_from_ext(ext: Optional[str]) -> Optional[str]:
     if not ext:
         return None
@@ -85,13 +109,13 @@ def _family_from_ext(ext: Optional[str]) -> Optional[str]:
 
 def _ladder_from_info(info: Dict[str, Any]) -> List[FormatOption]:
     """
-    Builds a list of FormatOption objects including:
-      - Progressive formats (video+audio)
-      - Merge formats (video-only + chosen best audio) -> format_string like "299+140-drc"
-        (UI uses "-drc" suffix only for display; your RN strips it before POSTing).
+    Builds a list of FormatOption objects with improved prioritization:
+      - Progressive formats (video+audio) - PRIORITIZED for better UX
+      - Merge formats (video-only + chosen best audio) with better size estimation
     """
     raw = info.get("formats") or []
     out: List[FormatOption] = []
+    duration = _safe_int(info.get("duration"))
 
     videos_only = []
     audios_only = []
@@ -117,6 +141,7 @@ def _ladder_from_info(info: Dict[str, Any]) -> List[FormatOption]:
             "acodec": acodec,
             "tbr": f.get("tbr"),
             "abr": f.get("abr"),
+            "vbr": f.get("vbr"),
         }
 
         if has_v and has_a:
@@ -126,15 +151,17 @@ def _ladder_from_info(info: Dict[str, Any]) -> List[FormatOption]:
         elif has_a and not has_v:
             audios_only.append(item)
 
-    # Progressive options (direct)
+    # Progressive options (direct) - PRIORITIZED and marked clearly
     for f in progressive:
         label, note = _fmt_label(f.get("width"), f.get("height"), f.get("fps"), f.get("ext"), False, f.get("format_note"))
+        # Add "direct" indicator to show these don't need merging
+        label = f"{label} • direct"
         out.append(
             FormatOption(
-                format_string=str(f.get("format_id")),  # e.g., "18" or "22"
+                format_string=str(f.get("format_id")),
                 label=label,
                 ext=f.get("ext") or "mp4",
-                note=note,
+                note=note or "no merge required",
                 sizeBytes=_approx_size(f),
             )
         )
@@ -148,9 +175,10 @@ def _ladder_from_info(info: Dict[str, Any]) -> List[FormatOption]:
         if not best_a:
             continue
 
-        size_sum = (_approx_size(v) or 0) + (_approx_size(best_a) or 0)
+        # Use improved size estimation
+        better_size = _estimate_merged_size(v, best_a, duration)
+        
         label, note = _fmt_label(v.get("width"), v.get("height"), v.get("fps"), v.get("ext"), True, v.get("format_note"))
-        # We append "-drc" (or any suffix) purely for UI; your RN code strips it before POST.
         fmt_string_ui = f"{v['format_id']}+{best_a['format_id']}-drc"
 
         out.append(
@@ -158,24 +186,31 @@ def _ladder_from_info(info: Dict[str, Any]) -> List[FormatOption]:
                 format_string=fmt_string_ui,
                 label=label,
                 ext=(v.get("ext") or "mp4"),
-                note=note or "merge",
-                sizeBytes=size_sum or None,
+                note=note or "merge required",
+                sizeBytes=better_size,
             )
         )
 
-    # Optional: sort by height desc, then fps desc, then size desc
+    # Improved sorting: Progressive first, then by quality
     def sort_key(o: FormatOption):
+        # Progressive formats get priority (lower sort value)
+        is_progressive = "direct" in o.label
+        priority = 0 if is_progressive else 1
+        
+        # Extract height for quality sorting
         h = 0
         try:
-            # label starts like "1080p60 • MP4 • merge"
             if "p" in o.label:
                 h = int(o.label.split("p")[0].split()[-1])
         except Exception:
             h = 0
+            
+        # Extract fps
         fps = 0
         if "p60" in o.label or "60" in o.label:
             fps = 60
-        return (-h, -fps, -(o.sizeBytes or 0))
+            
+        return (priority, -h, -fps, -(o.sizeBytes or 0))
 
     out.sort(key=sort_key)
     return out

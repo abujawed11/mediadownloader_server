@@ -175,6 +175,59 @@ Container = Literal["mp4", "webm", "mkv"]
 _TIME_RE = re.compile(r"time=(\d{2}):(\d{2}):(\d{2}\.\d+)")
 
 
+def _should_use_simple_merge(vcodec: str, acodec: str, container: str) -> bool:
+    """Determine if we should use simple merge strategy based on codecs."""
+    # Use simple merge for problematic combinations
+    problematic_vcodecs = {"av1", "vp9", "hevc"}
+    problematic_acodecs = {"opus", "vorbis"}
+    
+    if vcodec in problematic_vcodecs:
+        return True
+    if acodec in problematic_acodecs and container == "mp4":
+        return True
+    
+    return False
+
+
+def _build_simple_merge_cmd(video_path: str, audio_path: str, output_path: str, container: str) -> List[str]:
+    """Build a simple, reliable merge command."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c", "copy",
+        "-shortest",
+        "-loglevel", "info",
+        output_path,
+    ]
+    return cmd
+
+
+def _build_advanced_merge_cmd(video_path: str, audio_path: str, output_path: str, container: str) -> List[str]:
+    """Build an advanced merge command with optimization flags."""
+    extra: List[str] = []
+    
+    # Only add faststart for MP4 with safe codecs
+    if container == "mp4":
+        extra += ["-movflags", "+faststart"]
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-fflags", "+genpts",
+        "-i", video_path,
+        "-i", audio_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c", "copy",
+        "-shortest",
+        "-max_interleave_delta", "500000",  # More lenient than 0
+        *extra,
+        "-loglevel", "info",
+        output_path,
+    ]
+    return cmd
+
+
 def _parse_time_to_seconds(line: str) -> Optional[float]:
     m = _TIME_RE.search(line)
     if not m:
@@ -228,8 +281,8 @@ def merge_with_progress_copy(
     stderr_log_path: Optional[str] = None,
 ) -> None:
     """
-    Stream-copy mux with interleaving safeguards + watchdog.
-    Falls back to MKV if the first attempt fails (handled by caller by checking file existence).
+    Stream-copy mux with improved compatibility and error handling.
+    Falls back to MKV if the first attempt fails.
     """
     vprobe = ffprobe_basic(video_path)
     aprobe = ffprobe_basic(audio_path)
@@ -238,45 +291,34 @@ def merge_with_progress_copy(
     vcodec = (vprobe.get("vcodec") or "").lower()
     acodec = (aprobe.get("acodec") or "").lower()
 
-    # Disable +faststart during copy; it can hang with some streams even for H.264.
-    use_faststart = False
-
-    log.info("[merge] container=%s out=%s vcodec=%s acodec=%s faststart=%s",
-             container, output_path, vcodec, acodec, use_faststart)
+    log.info("[merge] container=%s out=%s vcodec=%s acodec=%s",
+             container, output_path, vcodec, acodec)
     log.info("[merge] inputs: video=%s audio=%s", video_path, audio_path)
 
-    extra: List[str] = []
-    if use_faststart and container == "mp4":
-        extra += ["-movflags", "+faststart"]
+    # Determine best strategy based on codecs
+    use_simple_cmd = _should_use_simple_merge(vcodec, acodec, container)
+    
+    if use_simple_cmd:
+        log.info("[merge] using simple merge strategy for compatibility")
+        base_cmd = _build_simple_merge_cmd(video_path, audio_path, output_path, container)
+        watchdog_timeout = 120  # More time for simple merge
+    else:
+        log.info("[merge] using advanced merge strategy with interleaving")
+        base_cmd = _build_advanced_merge_cmd(video_path, audio_path, output_path, container)
+        watchdog_timeout = 60  # Moderate time for advanced merge
 
-    # Interleaving/PTS flags to prevent stalls
-    base_cmd: List[str] = [
-        "ffmpeg", "-y",
-        "-fflags", "+genpts",
-        "-i", video_path,
-        "-i", audio_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-c", "copy",
-        "-shortest",
-        "-max_interleave_delta", "0",
-        "-muxpreload", "0",
-        "-muxdelay", "0",
-        *extra,
-        "-loglevel", "info",
-        output_path,
-    ]
-
-    def run_once(cmd: List[str], watchdog_seconds: int = 25) -> str:
+    def run_once(cmd: List[str], watchdog_seconds: int) -> str:
         log.info("[merge] cmd=%s", " ".join(shlex.quote(p) for p in cmd))
 
         log_fh = open(stderr_log_path, "w", encoding="utf-8") if stderr_log_path else None
         tail: List[str] = []
         last_log_ts = 0.0
 
-        # Watchdog on output file growth
+        # Improved watchdog: check both file growth and process activity
         last_size = 0
         last_growth_ts = time.time()
+        last_stderr_ts = time.time()
+        stall_count = 0
 
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
@@ -284,21 +326,36 @@ def merge_with_progress_copy(
                 on_progress(0.90, 0.0)
 
             while True:
-                # Periodically check growth even if no stderr line yet
+                # Check file growth and process activity
+                now = time.time()
                 try:
                     cur_size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
                     if cur_size > last_size:
                         last_size = cur_size
-                        last_growth_ts = time.time()
+                        last_growth_ts = now
+                        stall_count = 0  # Reset stall counter on progress
                 except Exception:
                     pass
 
-                # Watchdog: if no growth for N seconds, kill
-                if time.time() - last_growth_ts > watchdog_seconds and proc.poll() is None:
-                    log.error("[merge] watchdog: no output growth for %ds — killing ffmpeg", watchdog_seconds)
-                    proc.kill()
-                    time.sleep(0.2)
-                    raise RuntimeError("watchdog: no output growth")
+                # More sophisticated watchdog logic
+                time_since_growth = now - last_growth_ts
+                time_since_stderr = now - last_stderr_ts
+                
+                # Allow more time initially (FFmpeg setup), then enforce stricter timeouts
+                dynamic_timeout = min(watchdog_seconds, max(30, watchdog_seconds - stall_count * 5))
+                
+                if (time_since_growth > dynamic_timeout and 
+                    time_since_stderr > 10 and 
+                    proc.poll() is None):
+                    stall_count += 1
+                    if stall_count >= 3:  # Give 3 chances before killing
+                        log.error("[merge] watchdog: process stalled for %ds (growth) + %ds (stderr) — killing", 
+                                time_since_growth, time_since_stderr)
+                        proc.kill()
+                        time.sleep(0.2)
+                        raise RuntimeError(f"merge stalled: no progress for {time_since_growth:.1f}s")
+                    else:
+                        log.warning("[merge] watchdog: stall warning %d/3", stall_count)
 
                 line = proc.stderr.readline()
                 if not line:
@@ -307,6 +364,9 @@ def merge_with_progress_copy(
                     # small sleep to avoid busy loop
                     time.sleep(0.05)
                     continue
+
+                # Update stderr activity timestamp
+                last_stderr_ts = now
 
                 if log_fh:
                     log_fh.write(line)
@@ -319,14 +379,13 @@ def merge_with_progress_copy(
                     on_debug(line.rstrip())
 
                 t = _parse_time_to_seconds(line)
-                now = time.time()
                 if t is not None and dur and on_progress:
                     p = 0.90 + 0.09 * max(0.0, min(1.0, t / dur))
                     on_progress(p, t)
                     if now - last_log_ts > 1.0:
                         log.info("[merge] progress t=%.2fs p=%.1f%%", t, p * 100.0)
                         last_log_ts = now
-                elif ("Stream mapping" in line) or ("muxing" in line):
+                elif ("Stream mapping" in line) or ("muxing" in line) or ("Opening" in line):
                     log.info("[merge] %s", line.strip())
 
             ret = proc.wait()
@@ -347,20 +406,34 @@ def merge_with_progress_copy(
             except Exception:
                 pass
 
-    # Attempt once with requested container
+    # Attempt merge with chosen strategy
     try:
-        run_once(base_cmd)
+        run_once(base_cmd, watchdog_timeout)
         return
     except Exception as e1:
         log.error("[merge] first attempt failed in %s: %s", container, e1)
 
-        # Fallback to MKV
-        fallback_out = os.path.splitext(output_path)[0] + ".mkv"
-        fallback_cmd = base_cmd[:-2] + ["-loglevel", "info", fallback_out]
-        log.info("[merge] retrying in mkv: %s", fallback_out)
-        run_once(fallback_cmd)
-        # Caller will detect which file exists and move it.
-        return
+        # If we used advanced strategy, try simple strategy as fallback
+        if not use_simple_cmd:
+            log.info("[merge] retrying with simple merge strategy")
+            simple_cmd = _build_simple_merge_cmd(video_path, audio_path, output_path, container)
+            try:
+                run_once(simple_cmd, 120)  # Give more time for simple merge
+                return
+            except Exception as e2:
+                log.error("[merge] simple strategy also failed: %s", e2)
+
+        # Final fallback: try MKV container
+        if container != "mkv":
+            fallback_out = os.path.splitext(output_path)[0] + ".mkv"
+            simple_mkv_cmd = _build_simple_merge_cmd(video_path, audio_path, fallback_out, "mkv")
+            log.info("[merge] final fallback: trying MKV container: %s", fallback_out)
+            run_once(simple_mkv_cmd, 120)
+            # Caller will detect which file exists and move it
+            return
+        
+        # If all attempts failed, re-raise the last exception
+        raise
 
 
 
