@@ -5,8 +5,8 @@ settings = get_settings()
 
 celery_app = Celery(
     "media_downloader",
-    broker=f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}",
-    backend=f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/{settings.REDIS_DB}",
+    broker=settings.REDIS_URL,
+    backend=settings.REDIS_URL,
     include=["app.workers.celery_tasks"]
 )
 

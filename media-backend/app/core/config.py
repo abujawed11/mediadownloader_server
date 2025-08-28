@@ -10,7 +10,13 @@ class Settings(BaseModel):
     HOST: str = Field(default=os.getenv("HOST", "0.0.0.0"))
     PORT: int = Field(default=int(os.getenv("PORT", "8000")))
 
+    # Redis Configuration
     REDIS_URL: str = Field(default=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    REDIS_HOST: str = Field(default=os.getenv("REDIS_HOST", "localhost"))
+    REDIS_PORT: int = Field(default=int(os.getenv("REDIS_PORT", "6379")))
+    REDIS_DB: int = Field(default=int(os.getenv("REDIS_DB", "0")))
+    
+    # Legacy RQ settings (kept for compatibility)
     RQ_QUEUE: str = Field(default=os.getenv("RQ_QUEUE", "media"))
     RQ_JOB_TTL: int = Field(default=int(os.getenv("RQ_JOB_TTL", "86400")))  # 1 day
     RQ_RESULT_TTL: int = Field(default=int(os.getenv("RQ_RESULT_TTL", "604800")))  # 7 days
