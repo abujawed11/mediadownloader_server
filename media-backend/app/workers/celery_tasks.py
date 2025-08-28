@@ -41,10 +41,40 @@ def update_task_progress(status: str, progress: float = None, **extra):
         redis_client = get_redis()
         channel = f"tasks:{current_task.request.id}"
         import json
-        redis_client.publish(channel, json.dumps({
-            "task_id": current_task.request.id,
-            **meta
-        }))
+        
+        # Convert backend fields to frontend-expected format
+        frontend_data = {
+            "id": current_task.request.id,  # Frontend expects 'id' not 'task_id'
+            "status": status,
+            "timestamp": meta.get("timestamp"),
+            "message": meta.get("message", ""),
+        }
+        
+        # Add progress as progress01 (0-1 range) if available
+        if progress is not None:
+            frontend_data["progress01"] = max(0.0, min(1.0, progress))
+        
+        # Convert snake_case backend fields to camelCase frontend fields
+        if "downloaded_bytes" in meta:
+            frontend_data["downloadedBytes"] = meta["downloaded_bytes"]
+        if "total_bytes" in meta:
+            frontend_data["totalBytes"] = meta["total_bytes"] 
+        if "speed_mbps" in meta and meta["speed_mbps"]:
+            # Convert MB/s to bytes/s for frontend
+            frontend_data["speedBps"] = int(meta["speed_mbps"] * 1024 * 1024)
+        
+        # Copy other fields as-is
+        for key, value in meta.items():
+            if key not in ["downloaded_bytes", "total_bytes", "speed_mbps", "timestamp", "message"]:
+                frontend_data[key] = value
+                
+        # Add completion flags for frontend logic
+        if status.lower() in ["completed", "success"]:
+            frontend_data["finished"] = True
+        elif status.lower() in ["failed", "error"]:
+            frontend_data["failed"] = True
+            
+        redis_client.publish(channel, json.dumps(frontend_data))
     except Exception as e:
         log.warning(f"Failed to publish progress: {e}")
 

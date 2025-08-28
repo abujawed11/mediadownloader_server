@@ -92,8 +92,8 @@ async def ws_task_progress(websocket: WebSocket, task_id: str):
         except Exception:
             pass
 
-# Keep the old endpoint for backward compatibility
+# Frontend expects individual job endpoints
 @router.websocket("/ws/jobs/{job_id}")
 async def ws_job_progress_legacy(websocket: WebSocket, job_id: str):
-    """Legacy WebSocket endpoint - redirects to new task endpoint"""
+    """WebSocket endpoint for individual job progress - matches frontend expectations"""
     await ws_task_progress(websocket, job_id)
