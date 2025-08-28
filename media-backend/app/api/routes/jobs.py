@@ -1,12 +1,11 @@
-﻿from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from typing import List
-from rq.job import Job
+from typing import List, Dict, Any
 from ...models.schemas import CreateJobRequest, JobResponse
 from ...models.job_models import JobStatus
-from ...services.job_queue import enqueue_download_merge
-from ...services.redis_conn import get_queue
+from ...services.job_queue import enqueue_download_merge, enqueue_stream_download, get_task_status
 from ...core.logging import get_logger
+import os
 
 router = APIRouter(prefix="/media", tags=["jobs"])
 log = get_logger(__name__)
@@ -43,101 +42,101 @@ log = get_logger(__name__)
 #         sizeBytes=(job.result or {}).get("size_bytes") if job.is_finished else None,
 #     )
 
-def job_progress(job_id: str):
-    q = get_queue()
-    job = q.fetch_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    m = job.meta or {}
-    return {
-        "id": job.get_id(),
-        "status": m.get("status", "queued"),
-        "progress01": float(m.get("progress01", 0.0)),
-        "message": m.get("message"),
-        "finished": bool(job.is_finished),
-        "failed": bool(job.is_failed),
-        # extra metrics for UI:
-        "part": m.get("part"),  # "video" | "audio" | "merging" | "progressive"
-        "downloadedBytes": m.get("downloadedBytes"),
-        "totalBytes": m.get("totalBytes"),
-        "speedBps": m.get("speedBps"),
-        "etaSeconds": m.get("etaSeconds"),
-        "mergeTimeSec": m.get("mergeTimeSec"),
-    }
+def task_progress(task_id: str) -> Dict[str, Any]:
+    """Get progress for a Celery task"""
+    return get_task_status(task_id)
 
-def _job_to_response(job: Job) -> JobResponse:
-    meta = job.meta or {}
-    raw = meta.get("status", "queued")
-    # map worker -> enum
-    status_map = {"finished": "done", "failed": "error"}
-    mapped = status_map.get(raw, raw)
+def _task_to_response(task_status: Dict[str, Any]) -> JobResponse:
+    """Convert task status to JobResponse"""
+    status_map = {
+        "success": "done", 
+        "failure": "error", 
+        "pending": "queued",
+        "started": "running",
+        "completed": "done",
+        "failed": "error"
+    }
+    
+    raw_status = task_status.get("status", "pending")
+    mapped_status = status_map.get(raw_status, raw_status)
+    
     return JobResponse(
-        id=job.get_id(),
-        status=JobStatus(mapped),
-        progress01=float(meta.get("progress01", 0.0)),
-        message=meta.get("message"),
-        fileName=(job.result or {}).get("file_name") if job.is_finished else None,
-        mime=(job.result or {}).get("mime") if job.is_finished else None,
-        sizeBytes=(job.result or {}).get("size_bytes") if job.is_finished else None,
+        id=task_status.get("id"),
+        status=JobStatus(mapped_status),
+        progress01=float(task_status.get("progress", 0.0)),
+        message=task_status.get("message"),
+        fileName=task_status.get("file_name") if task_status.get("ready") else None,
+        mime=task_status.get("mime") if task_status.get("ready") else None,
+        sizeBytes=task_status.get("size_bytes") if task_status.get("ready") else None,
     )
 
 
 
-@router.post("/jobs", response_model=JobResponse)
-def create_job(body: CreateJobRequest) -> JobResponse:
+@router.post("/tasks", response_model=JobResponse)
+def create_task(body: CreateJobRequest) -> JobResponse:
     """
-    Enqueue a download/merge job.
+    Create a download task - automatically chooses best method
     """
-    job = enqueue_download_merge(body.model_dump())
-    return _job_to_response(job)
+    format_spec = body.format
+    payload = body.model_dump()
+    
+    if "+" in format_spec:
+        # Merge required
+        task = enqueue_download_merge(payload)
+    else:
+        # Progressive download
+        task = enqueue_stream_download(payload)
+    
+    return _task_to_response({"id": task.id, "status": "pending", "progress": 0.0})
 
+@router.get("/tasks/{task_id}", response_model=JobResponse)
+def get_task(task_id: str) -> JobResponse:
+    """Get task status"""
+    task_status = get_task_status(task_id)
+    return _task_to_response(task_status)
 
-@router.get("/jobs", response_model=List[JobResponse])
-def list_jobs() -> List[JobResponse]:
+@router.get("/tasks/{task_id}/file")
+def get_task_file(task_id: str):
     """
-    List recent jobs in the queue (best-effort).
+    Serve the final file for a completed task
     """
-    q = get_queue()
-    jobs = []
-    # Inspect both finished & started/queued (best-effort, not paginated)
-    for j in q.jobs:
-        jobs.append(_job_to_response(j))
-    for j in q.finished_job_registry.get_job_ids()[:50]:
-        job = q.fetch_job(j)
-        if job:
-            jobs.append(_job_to_response(job))
-    for j in q.failed_job_registry.get_job_ids()[:50]:
-        job = q.fetch_job(j)
-        if job:
-            jobs.append(_job_to_response(job))
-    return jobs
+    task_status = get_task_status(task_id)
+    
+    if task_status.get("status") not in ["success", "completed"]:
+        raise HTTPException(status_code=409, detail="Task not completed")
+    
+    file_path = task_status.get("path")
+    file_name = task_status.get("file_name")
+    mime = task_status.get("mime", "application/octet-stream")
+    
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(
+        file_path, 
+        filename=file_name, 
+        media_type=mime,
+        headers={
+            "Content-Disposition": f'attachment; filename="{file_name}"',
+            "X-Android-Download-Manager": "true"
+        }
+    )
 
+# Legacy endpoints for backward compatibility
+@router.post("/jobs", response_model=JobResponse) 
+def create_job_legacy(body: CreateJobRequest) -> JobResponse:
+    """Legacy endpoint - redirects to new task system"""
+    return create_task(body)
 
 @router.get("/jobs/{job_id}", response_model=JobResponse)
-def get_job(job_id: str) -> JobResponse:
-    q = get_queue()
-    job = q.fetch_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return _job_to_response(job)
-
+def get_job_legacy(job_id: str) -> JobResponse:
+    """Legacy endpoint"""
+    return get_task(job_id)
 
 @router.get("/jobs/{job_id}/file")
-def get_job_file(job_id: str):
-    """
-    Serve the final file for a finished job from local storage.
-    """
-    q = get_queue()
-    job = q.fetch_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not job.is_finished or not isinstance(job.result, dict):
-        raise HTTPException(status_code=409, detail="Job is not finished")
-    path = job.result.get("path")
-    file_name = job.result.get("file_name")
-    if not path or not file_name:
-        raise HTTPException(status_code=404, detail="File not available")
-    return FileResponse(path, filename=file_name, media_type=job.result.get("mime") or "application/octet-stream")
+def get_job_file_legacy(job_id: str):
+    """Legacy endpoint"""
+    return get_task_file(job_id)
 
 
 

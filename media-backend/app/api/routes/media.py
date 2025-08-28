@@ -1,7 +1,11 @@
 ﻿# app/api/routes/media.py
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response, BackgroundTasks
+from fastapi.responses import StreamingResponse, FileResponse
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
+import os
+import httpx
+import aiofiles
 
 from ...models.schemas import (
     InfoRequest,          # { url: str }
@@ -11,6 +15,7 @@ from ...models.schemas import (
     FormatOption,         # { format_string: str, label: str, ext?: str, note?: str, sizeBytes?: Optional[int] }
 )
 from ...services.ytdlp_service import extract_info
+from ...services.job_queue import enqueue_stream_download, enqueue_download_merge, get_task_status
 from ...core.logging import get_logger
 
 router = APIRouter(prefix="/media", tags=["media"])
@@ -95,6 +100,21 @@ def _estimate_merged_size(video: Dict[str, Any], audio: Dict[str, Any], duration
     
     # Last resort: use available size or return None
     return v_size or a_size
+
+def _get_mobile_optimized_headers(mime_type: str, filename: str) -> Dict[str, str]:
+    """Generate mobile-optimized headers for Android compatibility"""
+    return {
+        "Content-Type": mime_type,
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Accept-Ranges": "bytes",
+        "X-Content-Type-Options": "nosniff",
+        # Android-specific headers
+        "X-Android-Download-Manager": "true",
+        "X-Download-Options": "noopen"
+    }
 
 
 def _family_from_ext(ext: Optional[str]) -> Optional[str]:
@@ -245,62 +265,136 @@ def info(body: InfoRequest) -> InfoResponse:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/direct-url", response_model=DirectUrlResponse)
-def direct_url(body: DirectUrlRequest) -> DirectUrlResponse:
+@router.post("/stream/{format_id}")
+async def stream_download_direct(format_id: str, body: DirectUrlRequest):
     """
-    For progressive formats only:
-      - Returns a direct media URL and optional headers so the RN app can download directly.
-      - If a merge format_id like "299+140" is sent, respond 409 to force client to use the job flow.
+    Stream download for progressive formats with mobile-optimized headers
+    Returns streaming response that Android can save directly
     """
-    # Reject merged selections here — use your RQ/worker job flow instead.
-    if "+" in (body.format_id or ""):
-        raise HTTPException(status_code=409, detail="Selected format requires server merge")
-
+    if "+" in format_id:
+        # For merge formats, use the job system instead
+        task = enqueue_download_merge({
+            "url": body.url,
+            "format": format_id,
+            "title": "video"
+        })
+        return {"task_id": task.id, "message": "Merge job started, use WebSocket to track progress"}
+    
     try:
         info = extract_info(body.url)
-
-        # Find the matching progressive format by format_id
-        raw_formats = info.get("formats") or []
-        target: Optional[Dict[str, Any]] = None
-        for f in raw_formats:
-            if str(f.get("format_id")) == str(body.format_id):
-                vcodec = str(f.get("vcodec") or "none")
-                acodec = str(f.get("acodec") or "none")
-                if vcodec != "none" and acodec != "none":  # ensure progressive
-                    target = f
-                break
-
-        if not target:
+        
+        # Find progressive format
+        target_format = None
+        for fmt in info.get("formats", []):
+            if str(fmt.get("format_id")) == str(format_id):
+                vcodec = str(fmt.get("vcodec", "none"))
+                acodec = str(fmt.get("acodec", "none"))
+                if vcodec != "none" and acodec != "none":
+                    target_format = fmt
+                    break
+        
+        if not target_format:
             raise HTTPException(status_code=404, detail="Progressive format not found")
-
-        # yt-dlp often provides usable direct URLs. Some sites may need headers.
-        direct_url = target.get("url")
+        
+        direct_url = target_format.get("url")
         if not direct_url:
-            raise HTTPException(status_code=400, detail="No direct URL available for this format")
-
-        # Headers: per-format or top-level http headers if present
-        headers = {}
-        # format-level headers (rare but supported)
-        if isinstance(target.get("http_headers"), dict):
-            headers.update({str(k): str(v) for k, v in target["http_headers"].items()})
-        # top-level
-        if isinstance(info.get("http_headers"), dict):
-            headers.update({str(k): str(v) for k, v in info["http_headers"].items()})
-
-        # MIME and filename hint
-        mime = target.get("mime_type")
+            raise HTTPException(status_code=400, detail="No direct URL available")
+        
+        # Get file info
+        ext = target_format.get("ext", "mp4")
         title = (info.get("title") or "download").replace("/", "_").replace("\\", "_")
-        ext = target.get("ext") or ("webm" if (mime and "webm" in mime) else "mp4")
-        file_name = f"{title}.{ext}"
-
-        return DirectUrlResponse(
-            url=direct_url,
-            headers=(headers or None),
-            mime=mime,
-            fileName=file_name,
+        filename = f"{title}.{ext}"
+        mime_type = {
+            "mp4": "video/mp4",
+            "webm": "video/webm", 
+            "mkv": "video/x-matroska",
+            "m4a": "audio/mp4",
+            "mp3": "audio/mpeg"
+        }.get(ext, "application/octet-stream")
+        
+        # Create streaming generator
+        async def generate():
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream("GET", direct_url) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(chunk_size=1024*1024):
+                        yield chunk
+        
+        # Return streaming response with mobile-optimized headers
+        headers = _get_mobile_optimized_headers(mime_type, filename)
+        return StreamingResponse(
+            generate(),
+            media_type=mime_type,
+            headers=headers
         )
+        
     except HTTPException:
         raise
     except Exception as e:
-        log.exception("direct_url() failed")
+        log.exception("stream_download_direct failed")
         raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/download")
+def download_media(body: DirectUrlRequest):
+    """
+    Smart download endpoint that chooses the best method:
+    - Progressive formats: Direct streaming 
+    - Merge formats: Background job with WebSocket tracking
+    """
+    format_id = body.format_id
+    
+    if "+" in format_id:
+        # Merge format - use background job
+        task = enqueue_download_merge({
+            "url": body.url,
+            "format": format_id,
+            "title": body.url.split("/")[-1]  # Simple title extraction
+        })
+        return {
+            "method": "job",
+            "task_id": task.id, 
+            "websocket_url": f"/ws/tasks/{task.id}",
+            "message": "Download job started"
+        }
+    else:
+        # Progressive format - use streaming task for better reliability
+        task = enqueue_stream_download({
+            "url": body.url,
+            "format_id": format_id,
+            "title": body.url.split("/")[-1]
+        })
+        return {
+            "method": "stream_job",
+            "task_id": task.id,
+            "websocket_url": f"/ws/tasks/{task.id}",
+            "message": "Stream download started"
+        }
+
+@router.get("/task/{task_id}")
+def get_download_status(task_id: str):
+    """Get download task status"""
+    return get_task_status(task_id)
+
+@router.get("/download/{task_id}/file")
+def download_completed_file(task_id: str):
+    """Download completed file with mobile-optimized headers"""
+    task_info = get_task_status(task_id)
+    
+    if task_info.get("status") != "completed":
+        raise HTTPException(status_code=400, detail="Download not completed yet")
+    
+    file_path = task_info.get("path")
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    filename = task_info.get("file_name", "download")
+    mime_type = task_info.get("mime", "application/octet-stream")
+    
+    # Return file with mobile-optimized headers
+    headers = _get_mobile_optimized_headers(mime_type, filename)
+    return FileResponse(
+        file_path,
+        media_type=mime_type,
+        filename=filename,
+        headers=headers
+    )

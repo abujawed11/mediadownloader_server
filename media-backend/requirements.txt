@@ -6,9 +6,9 @@ httpx
 tenacity
 yt-dlp
 redis
-rq
-rq-scheduler
+celery[redis]
 boto3
 loguru
 python-slugify
 orjson
+aiofiles
