@@ -36,6 +36,8 @@ def update_task_progress(status: str, progress: float = None, **extra):
     # Update Celery task state
     current_task.update_state(state=status.upper(), meta=meta)
     
+    log.info(f"[{current_task.request.id}] Progress update: {status} {progress} - {extra}")
+    
     # Publish to Redis for real-time updates
     try:
         redis_client = get_redis()
@@ -74,9 +76,10 @@ def update_task_progress(status: str, progress: float = None, **extra):
         elif status.lower() in ["failed", "error"]:
             frontend_data["failed"] = True
             
+        log.info(f"[{current_task.request.id}] Publishing to Redis channel {channel}: {frontend_data}")
         redis_client.publish(channel, json.dumps(frontend_data))
     except Exception as e:
-        log.warning(f"Failed to publish progress: {e}")
+        log.error(f"Failed to publish progress: {e}")
 
 @celery_app.task(bind=True)
 def stream_download(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -133,6 +136,7 @@ def stream_download(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         downloaded_bytes = 0
         chunk_size = 1024 * 1024  # 1MB chunks
         start_time = time.time()
+        last_update_time = start_time
         
         with httpx.stream("GET", direct_url, timeout=60.0) as response:
             response.raise_for_status()
@@ -147,12 +151,21 @@ def stream_download(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                     f.write(chunk)
                     downloaded_bytes += len(chunk)
                     
+                    # Only update progress every 2 seconds or every 5% to avoid spam
+                    current_time = time.time()
                     if filesize > 0:
                         progress = 0.1 + 0.8 * (downloaded_bytes / filesize)
-                        update_task_progress("downloading", progress,
-                                           downloaded_bytes=downloaded_bytes,
-                                           total_bytes=filesize,
-                                           speed_mbps=round(downloaded_bytes / (1024*1024) / max(1, time.time() - start_time), 2))
+                        
+                        # Update every 2 seconds or every 5% progress
+                        if (current_time - last_update_time >= 2.0) or (progress >= 0.95):
+                            elapsed_time = max(1, current_time - start_time)
+                            speed_mbps = (downloaded_bytes / (1024*1024)) / elapsed_time
+                            
+                            update_task_progress("downloading", progress,
+                                               downloaded_bytes=downloaded_bytes,
+                                               total_bytes=filesize,
+                                               speed_mbps=round(speed_mbps, 2))
+                            last_update_time = current_time
         
         # Move to storage
         update_task_progress("finalizing", 0.95, message="Moving to storage...")

@@ -138,6 +138,16 @@ def get_job_file_legacy(job_id: str):
     """Legacy endpoint"""
     return get_task_file(job_id)
 
+@router.get("/jobs/{job_id}/progress")
+def get_job_progress(job_id: str):
+    """Get detailed job progress for debugging"""
+    task_status = get_task_status(job_id)
+    return {
+        "id": job_id,
+        "raw_status": task_status,
+        "formatted": _task_to_response(task_status).model_dump()
+    }
+
 
 
 
