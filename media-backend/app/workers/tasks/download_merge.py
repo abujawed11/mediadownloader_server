@@ -40,7 +40,16 @@ def _set_meta(*, status: Optional[str] = None, progress01: Optional[float] = Non
     m["failed"]   = (m.get("status") == "failed")
     job.meta = m
     job.save_meta()
-    # If you wired Redis pubsub to WS, publish here as well.
+    
+    # Publish to Redis pubsub for WebSocket updates
+    try:
+        import json
+        redis_client = get_redis()
+        channel = f"jobs:{job.id}"
+        payload = {"id": job.id, **m}
+        redis_client.publish(channel, json.dumps(payload))
+    except Exception as e:
+        log.warning(f"Failed to publish progress to Redis: {e}")
 
 
 def _ydl_download(url: str, fmt: str, outpath_noext: str, part: str, base: float, span: float) -> str:
