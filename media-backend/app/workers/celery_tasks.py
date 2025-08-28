@@ -1,18 +1,21 @@
 import os
 import uuid
 import time
-import httpx
-import aiofiles
-from typing import Dict, Any, Optional, AsyncGenerator
+from typing import Dict, Any, Optional
 from celery import current_task
-from celery.signals import task_prerun, task_postrun
 
 from ..core.celery_app import celery_app
 from ..core.logging import get_logger
 from ..services.storage_local import tmp_path, move_into_storage
-from ..services.ffmpeg_service import merge_simple_reliable
+from ..services.ffmpeg_simple import merge_simple_reliable
 from ..services.ytdlp_service import extract_info
 from ..services.redis_conn import get_redis
+
+# Import httpx lazily to avoid import issues
+try:
+    import httpx
+except ImportError:
+    httpx = None
 
 log = get_logger(__name__)
 
@@ -60,6 +63,10 @@ def stream_download(self, payload: Dict[str, Any]) -> Dict[str, Any]:
     log.info(f"[{self.request.id}] Starting stream download: {url}")
     update_task_progress("starting", 0.0, message="Extracting stream info...")
     
+    # Check if httpx is available
+    if httpx is None:
+        raise Exception("httpx is not installed. Please run: pip install httpx")
+    
     try:
         # Extract info to get direct URL
         info = extract_info(url)
@@ -95,6 +102,7 @@ def stream_download(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         
         downloaded_bytes = 0
         chunk_size = 1024 * 1024  # 1MB chunks
+        start_time = time.time()
         
         with httpx.stream("GET", direct_url, timeout=60.0) as response:
             response.raise_for_status()
@@ -114,7 +122,7 @@ def stream_download(self, payload: Dict[str, Any]) -> Dict[str, Any]:
                         update_task_progress("downloading", progress,
                                            downloaded_bytes=downloaded_bytes,
                                            total_bytes=filesize,
-                                           speed_mbps=round(downloaded_bytes / (1024*1024) / (time.time() - self.request.started_at or 1), 2))
+                                           speed_mbps=round(downloaded_bytes / (1024*1024) / max(1, time.time() - start_time), 2))
         
         # Move to storage
         update_task_progress("finalizing", 0.95, message="Moving to storage...")
@@ -173,7 +181,6 @@ def download_and_merge(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         
         # Use optimized yt-dlp download with better settings
         from ..services.ytdlp_optimized import download_format
-        from ..services.ffmpeg_simple import merge_simple_reliable
         
         # Download video (0-40%)
         update_task_progress("downloading", 0.0, message="Downloading video...")

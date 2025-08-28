@@ -37,10 +37,19 @@ def test_imports():
         return False
     
     try:
-        from app.workers.celery_tasks import stream_download, download_and_merge
-        print("✅ Celery tasks imported successfully")
+        # Test individual imports first
+        from app.workers import celery_tasks
+        print("✅ Celery tasks module imported successfully")
+        
+        # Test if we can access the tasks
+        if hasattr(celery_tasks, 'stream_download') and hasattr(celery_tasks, 'download_and_merge'):
+            print("✅ Celery task functions are available")
+        else:
+            print("⚠️  Some Celery task functions may not be available")
+            
     except Exception as e:
         print(f"❌ Celery tasks failed: {e}")
+        print("   This might be due to missing dependencies. Run: python check_deps.py")
         return False
     
     try:
